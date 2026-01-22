@@ -6,3 +6,8 @@ python3 app.py
 ```
 
 Visit [http://127.0.0.1:5000/](http://127.0.0.1:5000/)
+
+Then to expose and test on various devices run 
+```bash
+cloudflared tunnel --url http://127.0.0.1:8787
+```
