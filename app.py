@@ -1,1134 +1,1689 @@
 #!/usr/bin/env python3
-"""
-PersonaPlex Flask Demo Bootstrapper (single Python script)
-
-Adds what you asked for:
-- HF token ingress on the FRONTEND (password field stored in browser localStorage)
-- Dark monospace UI, 8px padding + 8px radius, #ffae00 accents, nested dark-grey panels/buttons
-- Model availability + download stats (bytes downloaded / total bytes, %)
-- Auto-downloads the model on first run (when token is present)
-
-What it does overall:
-- Clones https://github.com/NVIDIA/personaplex
-- Creates a local venv
-- Installs moshi/. + Flask + huggingface_hub
-- Writes a Flask demo web UI:
-    - Model panel: token entry, status, download button, progress, cache path
-    - Audio panel: record mic -> resample to 24kHz WAV -> runs `python -m moshi.offline` -> plays output WAV
-- Runs Flask
-
-Security note (demo):
-- The HF token is stored in the browser's localStorage and sent to the Flask server via an HTTP header.
-- Use on localhost or on a trusted LAN only. Don’t expose this publicly.
-
-Run:
-  python3 bootstrap_personaplex_flask_demo.py
-  python3 bootstrap_personaplex_flask_demo.py --dir ./ppdemo --host 0.0.0.0 --port 5000
-
-Optional:
-  --no-run   only bootstrap files, don’t run Flask
-"""
-
-import argparse
+# PersonaPlex Eval (all-in-one): venv bootstrap + clone NVIDIA/personaplex + install + Flask(WebSocket) UI
+#
+# What you get:
+# - Setup UI (dark monospace, #ffae00 accents) with HF token ingress (server-side only)
+# - Model download panel with clear stats + auto-download after token set
+# - "Start Talking" pill button enabled only after model is ready
+# - Live mic streaming to PersonaPlex (24kHz) and live playback of generated audio
+# - Fullscreen SVG ring visualizer driven by FFT (magenta=input, teal=output) + fading text cascade
+# - "X" button to return to setup view
+#
+# Notes:
+# - PersonaPlex is gated on Hugging Face: you must accept the license and provide HF token.
+# - This demo uses the repo's moshi/ package (installed editable) and Hugging Face cache.
+# - Requires a capable NVIDIA GPU for real-time. CPU will be slow or unusable.
+#
+# Run:
+#   python3 personaplex_eval_demo.py
+#
+# Optional env:
+#   PERSONAPLEX_HF_REPO="nvidia/personaplex-7b-v1"
+#   PERSONAPLEX_HOST="127.0.0.1"
+#   PERSONAPLEX_PORT="8787"
+#   TORCH_INDEX_URL="https://download.pytorch.org/whl/cu121"   (if you want to force CUDA wheels)
+#
+import base64
+import contextlib
+import dataclasses
+import json
 import os
+import secrets
 import shutil
+import signal
 import subprocess
 import sys
-import textwrap
-import venv
-from pathlib import Path
-
-REPO_URL = "https://github.com/NVIDIA/personaplex.git"
-DEFAULT_MODEL_REPO_ID = "nvidia/personaplex-7b-v1"
-
-APP_PY = r"""import os
-import sys
-import json
-import uuid
-import glob
 import threading
 import time
+import traceback
 from pathlib import Path
-from flask import Flask, request, jsonify, send_from_directory, render_template
+from typing import Dict, Optional, Tuple, List
 
-# ---- Config ----
-MODEL_REPO_ID = os.environ.get("PP_MODEL_REPO_ID", "nvidia/personaplex-7b-v1")
+ROOT = Path.cwd() / "personaplex_eval_demo"
+VENV_DIR = ROOT / ".venv"
+VENDOR_DIR = ROOT / "vendor"
+PERSONAPLEX_DIR = VENDOR_DIR / "personaplex"
 
-APP_DIR = Path(__file__).resolve().parent
-WORKDIR = APP_DIR.parent
-REPO_DIR = WORKDIR / "personaplex"
-RESULTS_DIR = APP_DIR / "results"
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_HF_REPO = os.environ.get("PERSONAPLEX_HF_REPO", "nvidia/personaplex-7b-v1")
+HOST = os.environ.get("PERSONAPLEX_HOST", "127.0.0.1")
+PORT = int(os.environ.get("PERSONAPLEX_PORT", "8787"))
 
-# Put HF cache inside the project directory so downloads are visible + portable
-HF_HOME = Path(os.environ.get("HF_HOME", str(WORKDIR / ".hf"))).resolve()
-HF_HUB_CACHE = Path(os.environ.get("HF_HUB_CACHE", str(HF_HOME / "hub"))).resolve()
+# --------- bootstrap helpers ---------
+def run(cmd: List[str], cwd: Optional[Path] = None, env: Optional[dict] = None) -> None:
+    print(f"+ {' '.join(cmd)}")
+    subprocess.check_call(cmd, cwd=str(cwd) if cwd else None, env=env)
 
-app = Flask(__name__, static_folder=str(APP_DIR / "static"), template_folder=str(APP_DIR / "templates"))
+def in_venv() -> bool:
+    return getattr(sys, "base_prefix", sys.prefix) != sys.prefix
 
-# ---- Model download state ----
-_dl_lock = threading.Lock()
-_dl_state = {
-    "state": "idle",          # idle | downloading | ready | error
-    "last_error": None,
-    "snapshot_dir": None,
-    "started_at": None,
-    "finished_at": None,
-    "total_bytes": None,      # best-effort; requires token to query
-}
+def venv_python() -> Path:
+    if sys.platform == "win32":
+        return VENV_DIR / "Scripts" / "python.exe"
+    return VENV_DIR / "bin" / "python"
 
-def _hf_model_cache_dir(repo_id: str) -> Path:
-    # HF cache layout: <HF_HUB_CACHE>/models--org--name
-    # repo_id like "nvidia/personaplex-7b-v1"
-    org, name = repo_id.split("/", 1)
-    return HF_HUB_CACHE / f"models--{org}--{name}"
+def venv_pip() -> Path:
+    if sys.platform == "win32":
+        return VENV_DIR / "Scripts" / "pip.exe"
+    return VENV_DIR / "bin" / "pip"
 
-def _sum_file_sizes(root: Path) -> int:
-    total = 0
-    if not root.exists():
+def ensure_dirs() -> None:
+    ROOT.mkdir(parents=True, exist_ok=True)
+    VENDOR_DIR.mkdir(parents=True, exist_ok=True)
+
+def ensure_venv_and_deps() -> None:
+    ensure_dirs()
+
+    if not VENV_DIR.exists():
+        print(f"Creating venv at: {VENV_DIR}")
+        run([sys.executable, "-m", "venv", str(VENV_DIR)])
+
+    if not in_venv():
+        print("Re-executing inside venv...")
+        os.execv(str(venv_python()), [str(venv_python()), str(Path(__file__).resolve())] + sys.argv[1:])
+
+    # Inside venv now
+    run([str(venv_pip()), "install", "--upgrade", "pip", "setuptools", "wheel"])
+
+    # Install core deps (torch/torchaudio can be heavy; we attempt a sensible default)
+    # If you already have torch installed (recommended), pip will skip.
+    core = [
+        "flask>=3.0.0",
+        "flask-sock>=0.7.0",
+        "gevent>=24.2.1",
+        "gevent-websocket>=0.10.1",
+        "huggingface_hub>=0.23.0",
+        "numpy>=1.24.0",
+        "tqdm>=4.66.0",
+    ]
+    run([str(venv_pip()), "install"] + core)
+
+    # Torch install (optional override)
+    try:
+        import torch  # noqa
+    except Exception:
+        idx = os.environ.get("TORCH_INDEX_URL", "").strip()
+        if idx:
+            run([str(venv_pip()), "install", "torch", "torchaudio", "--index-url", idx])
+        else:
+            # default: let pip decide (often CPU wheel)
+            run([str(venv_pip()), "install", "torch", "torchaudio"])
+
+def ensure_personaplex_repo() -> None:
+    ensure_dirs()
+    if not PERSONAPLEX_DIR.exists():
+        if shutil.which("git") is None:
+            raise RuntimeError("git is required but not found in PATH.")
+        print(f"Cloning NVIDIA/personaplex into: {PERSONAPLEX_DIR}")
+        run(["git", "clone", "--depth", "1", "https://github.com/NVIDIA/personaplex.git", str(PERSONAPLEX_DIR)])
+    else:
+        # Keep it simple: don't auto-pull to avoid surprising changes
+        print(f"Using existing repo at: {PERSONAPLEX_DIR}")
+
+def ensure_personaplex_moshi_installed() -> None:
+    moshi_path = PERSONAPLEX_DIR / "moshi"
+    if not moshi_path.exists():
+        raise RuntimeError(f"Expected moshi/ folder at: {moshi_path}")
+    # Install editable; if already installed, this is quick
+    run([str(venv_pip()), "install", "-e", str(moshi_path)])
+
+# --------- download + model state ---------
+@dataclasses.dataclass
+class DownloadState:
+    status: str = "idle"  # idle|need_token|downloading|ready|error
+    message: str = ""
+    repo_id: str = DEFAULT_HF_REPO
+    total_bytes: int = 0
+    done_bytes: int = 0
+    files_total: int = 0
+    files_done: int = 0
+    started_at: float = 0.0
+    finished_at: float = 0.0
+    last_error: str = ""
+
+    def as_dict(self) -> dict:
+        pct = 0.0
+        if self.total_bytes > 0:
+            pct = max(0.0, min(1.0, self.done_bytes / float(self.total_bytes)))
+        return {
+            "status": self.status,
+            "message": self.message,
+            "repo_id": self.repo_id,
+            "total_bytes": self.total_bytes,
+            "done_bytes": self.done_bytes,
+            "files_total": self.files_total,
+            "files_done": self.files_done,
+            "pct": pct,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "last_error": self.last_error,
+        }
+
+DOWNLOAD = DownloadState(status="need_token", message="HF token required to access gated model.")
+
+# HF token is kept server-side in memory keyed by session id.
+TOKENS: Dict[str, str] = {}
+TOKENS_LOCK = threading.Lock()
+
+# Model load is expensive; we keep a single shared weight set loaded.
+MODEL_LOCK = threading.Lock()
+MODEL_LOADED = False
+MODEL_ERR: Optional[str] = None
+# These will be set after load
+MIMI = None
+MOSHI_LM = None
+LOADERS = None
+LMGen = None
+TORCH = None
+
+VOICE_PROMPTS: Dict[str, str] = {}  # name -> path
+
+
+def find_voice_prompts(repo_root: Path) -> Dict[str, str]:
+    # Try to discover NAT*/VAR*.pt files anywhere in the repo.
+    out: Dict[str, str] = {}
+    patterns = ["NATF*.pt", "NATM*.pt", "VARF*.pt", "VARM*.pt"]
+    for pat in patterns:
+        for p in repo_root.rglob(pat):
+            name = p.stem
+            out[name] = str(p)
+    return dict(sorted(out.items(), key=lambda kv: kv[0]))
+
+
+def _hf_cache_bytes_for_repo(repo_id: str) -> int:
+    # Best-effort: compute size from huggingface cache snapshots for this repo.
+    # Works with default cache layout (~/.cache/huggingface/hub).
+    home = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
+    hub = home / "hub"
+    if not hub.exists():
         return 0
-    for p in root.rglob("*"):
-        try:
-            if p.is_file() and not p.is_symlink():
-                total += p.stat().st_size
-        except Exception:
-            pass
+    # Hugging Face cache uses "models--org--name"
+    safe = repo_id.replace("/", "--")
+    model_dir = hub / f"models--{safe}"
+    if not model_dir.exists():
+        return 0
+    total = 0
+    for fp in model_dir.rglob("*"):
+        if fp.is_file():
+            try:
+                total += fp.stat().st_size
+            except Exception:
+                pass
     return total
 
-def _downloaded_bytes(repo_id: str) -> int:
-    # "blobs" is where the actual content sits in HF cache
-    base = _hf_model_cache_dir(repo_id)
-    blobs = base / "blobs"
-    return _sum_file_sizes(blobs)
 
-def _snapshots(repo_id: str):
-    base = _hf_model_cache_dir(repo_id)
-    snaps = base / "snapshots"
-    if not snaps.exists():
-        return []
-    out = []
-    for p in snaps.iterdir():
-        if p.is_dir():
-            out.append(p.name)
-    out.sort()
-    return out
+def start_download_if_needed(session_id: str, repo_id: str) -> Tuple[bool, str]:
+    """
+    Starts download thread if:
+      - not already ready/downloading
+      - token present
+    Returns (started, message)
+    """
+    global DOWNLOAD
+    if DOWNLOAD.status in ("downloading", "ready"):
+        return (False, "Download already in progress or complete.")
+    with TOKENS_LOCK:
+        token = TOKENS.get(session_id, "").strip()
+    if not token:
+        DOWNLOAD.status = "need_token"
+        DOWNLOAD.message = "HF token required."
+        return (False, "HF token required.")
 
-def _voice_map():
-    patterns = [
-        str(REPO_DIR / "**" / "NAT*.pt"),
-        str(REPO_DIR / "**" / "VAR*.pt"),
-    ]
-    found = []
-    for pat in patterns:
-        found.extend(glob.glob(pat, recursive=True))
-    found = sorted(set(map(str, map(Path, found))))
-    out = {}
-    for p in found:
-        name = Path(p).name
-        out[name.replace(".pt", "")] = p
-    return out
-
-def _get_hf_token_from_request():
-    # Prefer header, then JSON/form fallback
-    tok = (request.headers.get("X-HF-Token") or "").strip()
-    if tok:
-        return tok
-    # JSON body
-    if request.is_json:
+    def worker():
+        global DOWNLOAD
         try:
-            j = request.get_json(silent=True) or {}
-            tok = (j.get("hf_token") or "").strip()
-            if tok:
-                return tok
+            from huggingface_hub import HfApi, hf_hub_download
+
+            DOWNLOAD.status = "downloading"
+            DOWNLOAD.message = "Fetching model metadata..."
+            DOWNLOAD.repo_id = repo_id
+            DOWNLOAD.started_at = time.time()
+            DOWNLOAD.finished_at = 0.0
+            DOWNLOAD.last_error = ""
+            DOWNLOAD.done_bytes = 0
+            DOWNLOAD.total_bytes = 0
+            DOWNLOAD.files_done = 0
+            DOWNLOAD.files_total = 0
+
+            api = HfApi()
+            info = api.model_info(repo_id, token=token)
+            # Keep to the practical set of files needed for inference; include common config/tokenizer files.
+            allow_suffixes = (
+                ".safetensors",
+                ".pt",
+                ".bin",
+                ".json",
+                ".txt",
+                ".model",
+                ".tiktoken",
+            )
+            siblings = []
+            total = 0
+            for s in getattr(info, "siblings", []) or []:
+                rfilename = getattr(s, "rfilename", "") or ""
+                size = int(getattr(s, "size", 0) or 0)
+                if rfilename.endswith(allow_suffixes):
+                    siblings.append((rfilename, size))
+                    total += size
+
+            # If we found nothing (HF page JS sometimes blocks sizes), fall back to downloading everything.
+            if not siblings:
+                DOWNLOAD.message = "Could not enumerate files; downloading full snapshot..."
+                from huggingface_hub import snapshot_download
+
+                snapshot_download(repo_id, token=token)
+                DOWNLOAD.status = "ready"
+                DOWNLOAD.message = "Download complete."
+                DOWNLOAD.finished_at = time.time()
+                return
+
+            DOWNLOAD.total_bytes = total
+            DOWNLOAD.files_total = len(siblings)
+            DOWNLOAD.message = f"Downloading {len(siblings)} files..."
+
+            done = 0
+            files_done = 0
+
+            for fname, sz in siblings:
+                # each file downloads to cache if not present
+                path = hf_hub_download(repo_id, fname, token=token)
+                # count actual size on disk if available
+                try:
+                    done += Path(path).stat().st_size
+                except Exception:
+                    done += sz
+                files_done += 1
+                DOWNLOAD.done_bytes = done
+                DOWNLOAD.files_done = files_done
+                DOWNLOAD.message = f"Downloading... ({files_done}/{DOWNLOAD.files_total})"
+
+            DOWNLOAD.status = "ready"
+            DOWNLOAD.message = "Model cached and ready."
+            DOWNLOAD.finished_at = time.time()
+
+        except Exception as e:
+            DOWNLOAD.status = "error"
+            DOWNLOAD.message = "Download failed."
+            DOWNLOAD.last_error = "".join(traceback.format_exception_only(type(e), e)).strip()
+            DOWNLOAD.finished_at = time.time()
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    return (True, "Started download.")
+
+
+def load_models_if_ready(session_id: str, repo_id: str) -> Tuple[bool, str]:
+    """
+    Lazy-load Mimi + Moshi LM weights into memory (GPU).
+    """
+    global MODEL_LOADED, MODEL_ERR, MIMI, MOSHI_LM, LOADERS, LMGen, TORCH
+    if not (DOWNLOAD.status == "ready"):
+        return (False, "Model not ready (download not complete).")
+
+    with TOKENS_LOCK:
+        token = TOKENS.get(session_id, "").strip()
+    if not token:
+        return (False, "HF token missing for loading (needed to fetch gated files even from cache).")
+
+    with MODEL_LOCK:
+        if MODEL_LOADED:
+            return (True, "Model already loaded.")
+        if MODEL_ERR:
+            return (False, f"Previous load error: {MODEL_ERR}")
+
+        try:
+            import torch
+            from huggingface_hub import hf_hub_download
+
+            TORCH = torch
+
+            # Import the moshi package installed from NVIDIA/personaplex repo.
+            from moshi.models import loaders, LMGen as _LMGen
+
+            LOADERS = loaders
+            LMGen = _LMGen
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            # Grab weight filenames expected by loaders (MIMI_NAME/MOSHI_NAME).
+            mimi_name = getattr(loaders, "MIMI_NAME", None)
+            moshi_name = getattr(loaders, "MOSHI_NAME", None)
+            if not mimi_name or not moshi_name:
+                raise RuntimeError("moshi.models.loaders missing MIMI_NAME/MOSHI_NAME; incompatible moshi package?")
+
+            mimi_weight = hf_hub_download(repo_id, mimi_name, token=token)
+            moshi_weight = hf_hub_download(repo_id, moshi_name, token=token)
+
+            mimi = loaders.get_mimi(mimi_weight, device=device)
+            # Moshi expects up to 8 codebooks in many configs; keep as default but try set if available.
+            with contextlib.suppress(Exception):
+                mimi.set_num_codebooks(8)
+
+            moshi_lm = loaders.get_moshi_lm(moshi_weight, device=device)
+
+            # Warm up (optional)
+            MODEL_LOADED = True
+            MODEL_ERR = None
+            MIMI = mimi
+            MOSHI_LM = moshi_lm
+            return (True, f"Loaded on {device}.")
+
+        except Exception as e:
+            MODEL_ERR = "".join(traceback.format_exception_only(type(e), e)).strip()
+            return (False, MODEL_ERR)
+
+
+# --------- live session inference ---------
+class PersonaPlexLiveSession:
+    """
+    One live, stateful session.
+    We create an LMGen instance per session, but share weights (MOSHI_LM, MIMI).
+    """
+    def __init__(self, text_prompt: str, voice_prompt_path: Optional[str], temp: float = 0.8, temp_text: float = 0.7):
+        if not MODEL_LOADED:
+            raise RuntimeError("Model not loaded.")
+        self.torch = TORCH
+        self.device = "cuda" if TORCH.cuda.is_available() else "cpu"
+
+        # Share weights but create fresh streaming state:
+        self.mimi = MIMI
+        self.lm_gen = LMGen(MOSHI_LM, temp=temp, temp_text=temp_text)
+
+        self.frame_size = int(getattr(self.mimi, "frame_size", 1920))  # 80ms @ 24kHz
+        self.text_prompt = (text_prompt or "").strip()
+        self.voice_prompt_path = voice_prompt_path
+
+        self._text_decoder = self._discover_text_decoder()
+
+    def _discover_text_decoder(self):
+        # Best-effort: PersonaPlex/Moshi may expose tokenizer or decode utilities.
+        # We'll try common attribute names.
+        candidates = [
+            ("tokenizer", "decode"),
+            ("text_tokenizer", "decode"),
+            ("tok", "decode"),
+        ]
+        for obj_name, meth in candidates:
+            obj = getattr(self.lm_gen, obj_name, None)
+            if obj and hasattr(obj, meth):
+                return lambda t: obj.decode([t])
+        # Some builds attach tokenizer on the underlying model
+        base = getattr(self.lm_gen, "lm", None) or getattr(self.lm_gen, "model", None) or MOSHI_LM
+        for obj_name, meth in candidates:
+            obj = getattr(base, obj_name, None)
+            if obj and hasattr(obj, meth):
+                return lambda t: obj.decode([t])
+        return None
+
+    def _maybe_apply_text_prompt(self):
+        if not self.text_prompt:
+            return
+        # Try known prompt setters (varies by fork).
+        for name in ("set_text_prompt", "set_prompt", "set_system_prompt", "apply_text_prompt", "condition_text_prompt"):
+            fn = getattr(self.lm_gen, name, None)
+            if callable(fn):
+                fn(self.text_prompt)
+                return
+        # Try on underlying model
+        base = getattr(self.lm_gen, "lm", None) or getattr(self.lm_gen, "model", None) or MOSHI_LM
+        for name in ("set_text_prompt", "set_prompt", "set_system_prompt", "apply_text_prompt", "condition_text_prompt"):
+            fn = getattr(base, name, None)
+            if callable(fn):
+                fn(self.text_prompt)
+                return
+        # If no method found, silently continue (still works, just without persona conditioning).
+
+    def _prime_voice_prompt(self):
+        if not self.voice_prompt_path:
+            return
+        p = Path(self.voice_prompt_path)
+        if not p.exists():
+            return
+
+        vp = self.torch.load(str(p), map_location="cpu")
+        # Expect voice prompt as sequence of audio tokens. We try to coerce to [1, K, T].
+        # Common formats: [K, T], [1, K, T], dict containing "codes".
+        if isinstance(vp, dict):
+            for k in ("codes", "tokens", "audio_tokens", "prompt"):
+                if k in vp:
+                    vp = vp[k]
+                    break
+
+        if not hasattr(vp, "shape"):
+            return
+
+        t = vp
+        if len(t.shape) == 2:
+            t = t.unsqueeze(0)  # [1,K,T]
+        if len(t.shape) == 3 and t.shape[0] != 1:
+            # take first
+            t = t[:1]
+        if len(t.shape) != 3:
+            return
+        # Prime frame by frame: t is [1,K,T]
+        # LMGen.step expects [B,K,1] per step in many builds.
+        # We'll feed each timestep as [1,K,1]
+        for i in range(t.shape[-1]):
+            frame_codes = t[:, :, i:i+1].to(self.device)
+            _ = self.lm_gen.step(frame_codes)
+
+    def step_pcm16(self, pcm16: bytes) -> Tuple[Optional[bytes], Optional[str]]:
+        """
+        pcm16: little-endian int16 mono, exactly frame_size samples @ 24kHz
+        Returns (out_pcm16_frame, text_delta)
+        """
+        # Convert to float32 tensor [-1,1]
+        import numpy as np
+        x = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
+        if x.shape[0] != self.frame_size:
+            # pad/truncate to frame_size
+            if x.shape[0] < self.frame_size:
+                x = np.pad(x, (0, self.frame_size - x.shape[0]))
+            else:
+                x = x[: self.frame_size]
+        wav = self.torch.from_numpy(x).view(1, 1, self.frame_size).to(self.device)
+
+        # Encode -> step -> decode
+        codes_in = self.mimi.encode(wav)  # [1,K,1]
+        tokens_out = self.lm_gen.step(codes_in)
+
+        if tokens_out is None:
+            return (None, None)
+
+        # tokens_out often: [B, 1+K, 1] where tokens_out[:,0,0]=text token and [:,1:,:]=audio codes
+        text_delta = None
+        try:
+            tok = int(tokens_out[0, 0, 0].item())
+            if self._text_decoder and tok != 0:
+                # decode single token; may be piece
+                piece = self._text_decoder(tok)
+                if piece and isinstance(piece, str):
+                    text_delta = piece
         except Exception:
             pass
-    # Form field
-    try:
-        tok = (request.form.get("hf_token") or "").strip()
-        if tok:
-            return tok
-    except Exception:
-        pass
-    return ""
 
-def _ensure_hf_libs():
-    try:
-        import huggingface_hub  # noqa: F401
-        return True, None
-    except Exception as e:
-        return False, f"huggingface_hub import failed: {e}"
-
-def _compute_total_bytes(repo_id: str, token: str):
-    # Best effort; requires gated access
-    try:
-        from huggingface_hub import HfApi
-        api = HfApi(token=token)
-        info = api.model_info(repo_id, files_metadata=True)
-        total = 0
-        siblings = getattr(info, "siblings", []) or []
-        for s in siblings:
-            sz = getattr(s, "size", None)
-            if isinstance(sz, int):
-                total += sz
-        return total if total > 0 else None, None
-    except Exception as e:
-        return None, str(e)
-
-def _is_ready(repo_id: str, token: str = "") -> bool:
-    # If we know total_bytes, check near-complete; else just check any snapshot exists.
-    snaps = _snapshots(repo_id)
-    if not snaps:
-        return False
-    with _dl_lock:
-        tb = _dl_state.get("total_bytes")
-    if tb and tb > 0:
-        db = _downloaded_bytes(repo_id)
-        return db >= int(tb * 0.98)
-    return True
-
-def _start_download_background(repo_id: str, token: str):
-    ok, err = _ensure_hf_libs()
-    if not ok:
-        with _dl_lock:
-            _dl_state["state"] = "error"
-            _dl_state["last_error"] = err
-        return
-
-    with _dl_lock:
-        if _dl_state["state"] == "downloading":
-            return
-        _dl_state["state"] = "downloading"
-        _dl_state["last_error"] = None
-        _dl_state["started_at"] = time.time()
-        _dl_state["finished_at"] = None
-        _dl_state["snapshot_dir"] = None
-
-    def _worker():
         try:
-            from huggingface_hub import snapshot_download
-
-            # cache_dir should be the HF hub cache root
-            cache_dir = str(HF_HUB_CACHE)
-
-            snap = snapshot_download(
-                repo_id=repo_id,
-                token=token,
-                cache_dir=cache_dir,
-                resume_download=True,
-            )
-
-            with _dl_lock:
-                _dl_state["snapshot_dir"] = snap
-                _dl_state["state"] = "ready"
-                _dl_state["finished_at"] = time.time()
-        except Exception as e:
-            with _dl_lock:
-                _dl_state["state"] = "error"
-                _dl_state["last_error"] = str(e)
-                _dl_state["finished_at"] = time.time()
-
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-
-def _fmt_mb(n):
-    if n is None:
-        return None
-    return round(n / (1024 * 1024), 2)
-
-@app.get("/")
-def index():
-    return render_template("index.html")
-
-@app.get("/api/voices")
-def voices():
-    vmap = _voice_map()
-    return jsonify({"voices": sorted(vmap.keys())})
-
-@app.get("/api/model/status")
-def model_status():
-    token = _get_hf_token_from_request()
-    # If we have a token, compute total size best-effort and remember it
-    if token:
-        total, terr = _compute_total_bytes(MODEL_REPO_ID, token)
-        if total:
-            with _dl_lock:
-                _dl_state["total_bytes"] = total
-
-    with _dl_lock:
-        state = dict(_dl_state)
-
-    db = _downloaded_bytes(MODEL_REPO_ID)
-    tb = state.get("total_bytes")
-    pct = None
-    if tb and tb > 0:
-        pct = max(0.0, min(100.0, (db / tb) * 100.0))
-
-    ready = _is_ready(MODEL_REPO_ID, token)
-
-    return jsonify({
-        "ok": True,
-        "repo_id": MODEL_REPO_ID,
-        "hf_home": str(HF_HOME),
-        "hf_hub_cache": str(HF_HUB_CACHE),
-        "cache_model_dir": str(_hf_model_cache_dir(MODEL_REPO_ID)),
-        "state": state.get("state"),
-        "last_error": state.get("last_error"),
-        "started_at": state.get("started_at"),
-        "finished_at": state.get("finished_at"),
-        "snapshot_dir": state.get("snapshot_dir"),
-        "snapshots": _snapshots(MODEL_REPO_ID),
-        "downloaded_bytes": db,
-        "total_bytes": tb,
-        "downloaded_mb": _fmt_mb(db),
-        "total_mb": _fmt_mb(tb) if tb else None,
-        "percent": round(pct, 2) if pct is not None else None,
-        "ready": bool(ready),
-    })
-
-@app.post("/api/model/download")
-def model_download():
-    token = _get_hf_token_from_request()
-    if not token:
-        return jsonify({"ok": False, "error": "Missing HF token. Provide X-HF-Token header or hf_token in JSON."}), 400
-
-    # Update total_bytes if possible
-    total, terr = _compute_total_bytes(MODEL_REPO_ID, token)
-    if total:
-        with _dl_lock:
-            _dl_state["total_bytes"] = total
-
-    _start_download_background(MODEL_REPO_ID, token)
-    return jsonify({"ok": True, "message": "Download started (or already running)."}), 202
-
-@app.post("/api/offline")
-def offline():
-    # Require model ready (or at least snapshots exist) to keep UX clean.
-    # If you want to allow moshi to download on demand, remove this gate.
-    token = _get_hf_token_from_request()
-
-    if not _is_ready(MODEL_REPO_ID, token):
-        # If we have a token, auto-start download then instruct client to wait
-        if token:
-            _start_download_background(MODEL_REPO_ID, token)
-            return jsonify({
-                "ok": False,
-                "error": "Model not ready yet. Download started; poll /api/model/status.",
-                "code": "MODEL_NOT_READY"
-            }), 409
-        return jsonify({
-            "ok": False,
-            "error": "Model not ready and no HF token provided. Enter token and download first.",
-            "code": "MODEL_NOT_READY_NO_TOKEN"
-        }), 409
-
-    if "audio" not in request.files:
-        return jsonify({"ok": False, "error": "Missing form file field 'audio'"}), 400
-
-    audio_file = request.files["audio"]
-    voice = (request.form.get("voice") or "NATF2").strip()
-    text_prompt = (request.form.get("text_prompt") or "").strip()
-    seed = (request.form.get("seed") or "42424242").strip()
-
-    vmap = _voice_map()
-    if voice not in vmap:
-        return jsonify({"ok": False, "error": f"Unknown voice '{voice}'. Try /api/voices"}), 400
-
-    job_id = uuid.uuid4().hex
-    job_dir = RESULTS_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-
-    in_wav = job_dir / "input.wav"
-    out_wav = job_dir / "output.wav"
-    out_json = job_dir / "output.json"
-
-    audio_file.save(in_wav)
-
-    cmd = [
-        sys.executable, "-m", "moshi.offline",
-        "--voice-prompt", vmap[voice],
-        "--input-wav", str(in_wav),
-        "--seed", str(seed),
-        "--output-wav", str(out_wav),
-        "--output-text", str(out_json),
-    ]
-    if text_prompt:
-        cmd.extend(["--text-prompt", text_prompt])
-
-    env = os.environ.copy()
-    # Force moshi + HF libs to use our project-local HF cache
-    env["HF_HOME"] = str(HF_HOME)
-    env["HF_HUB_CACHE"] = str(HF_HUB_CACHE)
-
-    # If provided via UI, forward token for any gated access
-    if token:
-        env["HF_TOKEN"] = token
-
-    try:
-        proc = __import__("subprocess").run(
-            cmd,
-            cwd=str(REPO_DIR),
-            env=env,
-            stdout=__import__("subprocess").PIPE,
-            stderr=__import__("subprocess").PIPE,
-            text=True,
-            check=True,
-        )
-    except __import__("subprocess").CalledProcessError as e:
-        err = (e.stderr or e.stdout or str(e))[-4000:]
-        return jsonify({"ok": False, "error": "moshi.offline failed", "details": err}), 500
-
-    txt = None
-    if out_json.exists():
-        try:
-            txt = json.loads(out_json.read_text(encoding="utf-8"))
+            audio_codes = tokens_out[:, 1:, :]  # [1,K,1]
+            out_wav = self.mimi.decode(audio_codes)  # [1,1,T]
+            out = out_wav.detach().float().clamp(-1, 1).cpu().numpy().reshape(-1)
+            out_i16 = (out * 32767.0).astype("int16").tobytes()
+            return (out_i16, text_delta)
         except Exception:
-            txt = {"raw": out_json.read_text(encoding="utf-8", errors="replace")}
+            return (None, text_delta)
 
-    return jsonify({
-        "ok": True,
-        "job_id": job_id,
-        "voice": voice,
-        "output_wav_url": f"/results/{job_id}/output.wav",
-        "output_json_url": f"/results/{job_id}/output.json",
-        "output_text": txt,
-        "stdout_tail": (proc.stdout or "")[-2000:],
-    })
+    def streaming_context(self):
+        return contextlib.ExitStack()
 
-@app.get("/results/<job_id>/<path:filename>")
-def results(job_id, filename):
-    safe_dir = RESULTS_DIR / job_id
-    if not safe_dir.exists():
-        return "Not found", 404
-    return send_from_directory(str(safe_dir), filename, as_attachment=False)
 
-if __name__ == "__main__":
-    host = os.environ.get("FLASK_HOST", "127.0.0.1")
-    port = int(os.environ.get("FLASK_PORT", "5000"))
-    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+# Allow only one live session by default (stateful, heavy).
+LIVE_LOCK = threading.Lock()
 
-    print(f"Flask demo: http://{host}:{port}")
-    print(f"Model: {MODEL_REPO_ID}")
-    print(f"HF_HOME: {HF_HOME}")
-    print(f"HF_HUB_CACHE: {HF_HUB_CACHE}")
-    app.run(host=host, port=port, debug=debug, threaded=True)
-"""
+# --------- Flask app ---------
+def create_app():
+    from flask import Flask, request, make_response, jsonify, session, Response
+    from flask_sock import Sock
 
+    app = Flask(__name__)
+    app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(16))
+    sock = Sock(app)
+
+    # Session id cookie
+    @app.before_request
+    def _ensure_sid():
+        if "sid" not in session:
+            session["sid"] = secrets.token_urlsafe(16)
+
+    @app.get("/api/status")
+    def api_status():
+        sid = session.get("sid")
+        cache_bytes = _hf_cache_bytes_for_repo(DOWNLOAD.repo_id)
+        payload = DOWNLOAD.as_dict()
+        payload["hf_cache_bytes_estimate"] = cache_bytes
+        payload["model_loaded"] = MODEL_LOADED
+        payload["model_error"] = MODEL_ERR
+        payload["voices"] = list(VOICE_PROMPTS.keys())
+        payload["default_voice"] = "NATF2" if "NATF2" in VOICE_PROMPTS else (list(VOICE_PROMPTS.keys())[0] if VOICE_PROMPTS else "")
+        payload["has_token"] = bool(TOKENS.get(sid, "").strip())
+        return jsonify(payload)
+
+    @app.post("/api/set_token")
+    def api_set_token():
+        sid = session.get("sid")
+        data = request.get_json(force=True, silent=True) or {}
+        token = (data.get("token") or "").strip()
+        if not token:
+            return jsonify({"ok": False, "error": "Missing token"}), 400
+        with TOKENS_LOCK:
+            TOKENS[sid] = token
+        # auto-download if not ready
+        if DOWNLOAD.status in ("need_token", "idle", "error"):
+            start_download_if_needed(sid, DOWNLOAD.repo_id)
+        return jsonify({"ok": True})
+
+    @app.post("/api/clear_token")
+    def api_clear_token():
+        sid = session.get("sid")
+        with TOKENS_LOCK:
+            TOKENS.pop(sid, None)
+        return jsonify({"ok": True})
+
+    @app.post("/api/start_download")
+    def api_start_download():
+        sid = session.get("sid")
+        data = request.get_json(force=True, silent=True) or {}
+        repo = (data.get("repo_id") or DOWNLOAD.repo_id or DEFAULT_HF_REPO).strip()
+        DOWNLOAD.repo_id = repo
+        started, msg = start_download_if_needed(sid, repo)
+        return jsonify({"ok": True, "started": started, "message": msg})
+
+    @app.post("/api/load_model")
+    def api_load_model():
+        sid = session.get("sid")
+        data = request.get_json(force=True, silent=True) or {}
+        repo = (data.get("repo_id") or DOWNLOAD.repo_id or DEFAULT_HF_REPO).strip()
+        ok, msg = load_models_if_ready(sid, repo)
+        return jsonify({"ok": ok, "message": msg})
+
+    @sock.route("/ws/live")
+    def ws_live(ws):
+        # This is a simple binary+json protocol:
+        # Client sends first message as JSON text:
+        #   {"type":"config","text_prompt":"...","voice":"NATF2","temp":0.8,"temp_text":0.7}
+        # Then sends audio frames as bytes:
+        #   b'\x01' + <pcm16 bytes for exactly frame_size samples>
+        # Server sends:
+        #   JSON strings for events (ready/text/error)
+        #   b'\x02' + <pcm16 out frame>
+        try:
+            with LIVE_LOCK:
+                sid = None
+                # Receive config
+                first = ws.receive()
+                if not isinstance(first, str):
+                    ws.send(json.dumps({"type": "error", "error": "Expected JSON config as first message."}))
+                    return
+                cfg = json.loads(first)
+                if cfg.get("type") != "config":
+                    ws.send(json.dumps({"type": "error", "error": "First message must be type=config."}))
+                    return
+
+                # Ensure model downloaded and loaded
+                # (We don't have flask session in ws handler easily; pass token by separate /api endpoints.)
+                if DOWNLOAD.status != "ready":
+                    ws.send(json.dumps({"type": "error", "error": "Model not downloaded yet."}))
+                    return
+                if not MODEL_LOADED:
+                    # We can't read flask session here reliably; ask client to call /api/load_model first.
+                    ws.send(json.dumps({"type": "need_load", "message": "Call /api/load_model before starting."}))
+                    return
+
+                text_prompt = (cfg.get("text_prompt") or "").strip()
+                voice = (cfg.get("voice") or "").strip()
+                temp = float(cfg.get("temp") or 0.8)
+                temp_text = float(cfg.get("temp_text") or 0.7)
+                voice_path = VOICE_PROMPTS.get(voice) if voice else None
+
+                session_obj = PersonaPlexLiveSession(
+                    text_prompt=text_prompt,
+                    voice_prompt_path=voice_path,
+                    temp=temp,
+                    temp_text=temp_text,
+                )
+
+                # Start streaming contexts and prime prompts if possible.
+                torch = TORCH
+                ws.send(json.dumps({"type": "ready", "frame_size": session_obj.frame_size, "sample_rate": 24000}))
+
+                # Run streaming in a single loop: every inbound audio frame -> step -> send outbound
+                # Use moshi streaming contexts for performance/statefulness.
+                with torch.no_grad(), session_obj.lm_gen.streaming(1), session_obj.mimi.streaming(1):
+                    # Apply prompts
+                    with contextlib.suppress(Exception):
+                        session_obj._maybe_apply_text_prompt()
+                    with contextlib.suppress(Exception):
+                        session_obj._prime_voice_prompt()
+
+                    text_accum = ""
+                    while True:
+                        msg = ws.receive()
+                        if msg is None:
+                            break
+
+                        if isinstance(msg, str):
+                            # control messages
+                            try:
+                                j = json.loads(msg)
+                            except Exception:
+                                continue
+                            if j.get("type") == "ping":
+                                ws.send(json.dumps({"type": "pong", "t": time.time()}))
+                            continue
+
+                        # binary audio
+                        b = msg
+                        if not b:
+                            continue
+                        mtype = b[0]
+                        if mtype != 0x01:
+                            continue
+                        pcm = b[1:]
+
+                        out_pcm, tdelta = session_obj.step_pcm16(pcm)
+                        if tdelta:
+                            text_accum += tdelta
+                            # send incremental (and let client render cascading pieces)
+                            ws.send(json.dumps({"type": "text", "delta": tdelta, "full": text_accum[-2000:]}))
+
+                        if out_pcm:
+                            ws.send(b"\x02" + out_pcm)
+
+        except Exception as e:
+            err = "".join(traceback.format_exception_only(type(e), e)).strip()
+            try:
+                ws.send(json.dumps({"type": "error", "error": err}))
+            except Exception:
+                pass
+
+    @app.get("/")
+    def index():
+        # One-page app: setup view + talk view. Start Talking triggers getUserMedia in same gesture.
+        html = INDEX_HTML
+        resp = make_response(html)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    return app
+
+
+# --------- Frontend (single-page) ---------
 INDEX_HTML = r"""<!doctype html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>PersonaPlex Flask Demo</title>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>PersonaPlex Eval</title>
   <style>
     :root{
-      --bg:#0b0b0b;
-      --panel:#141414;
-      --panel2:#1b1b1b;
-      --btn:#232323;
-      --btn2:#2a2a2a;
-      --text:#e8e8e8;
-      --muted:#a9a9a9;
-      --accent:#ffae00;
-      --danger:#ff4d4d;
-      --ok:#66ff99;
-      --radius:8px;
-      --pad:8px;
+      --bg: #0b0b0c;
+      --panel: #141416;
+      --panel2: #1b1b1e;
+      --muted: #a8a8aa;
+      --text: #f2f2f3;
+      --accent: #ffae00;
+      --danger: #ff4d4d;
+      --ok: #39d98a;
+      --ring-magenta: #ff3bd4;
+      --ring-teal: #27f3ff;
+      --radius: 8px;
+      --pad: 14px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
     }
     *{ box-sizing:border-box; }
+    html,body{ height:100%; }
     body{
       margin:0;
-      background:var(--bg);
-      color:var(--text);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      background: radial-gradient(1200px 900px at 15% 10%, #141416 0%, #0b0b0c 55%, #070708 100%);
+      color: var(--text);
+      font-family: var(--mono);
+      letter-spacing: 0.1px;
     }
     .wrap{
-      max-width:1200px;
-      margin:0 auto;
-      padding:16px;
-      display:grid;
-      grid-template-columns: 420px 1fr;
-      gap:16px;
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 22px;
+    }
+    .topbar{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap: 14px;
+      margin-bottom: 16px;
     }
     .title{
-      grid-column:1 / -1;
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text);
       display:flex;
       align-items:center;
-      justify-content:space-between;
-      padding:var(--pad);
-      border:1px solid #202020;
-      border-radius:var(--radius);
-      background:linear-gradient(180deg, #111 0%, #0c0c0c 100%);
-    }
-    .title h1{
-      margin:0;
-      font-size:18px;
-      letter-spacing:0.4px;
-    }
-    .badge{
-      padding:6px 10px;
-      border-radius:999px;
-      border:1px solid rgba(255,174,0,0.35);
-      color:var(--accent);
-      background:rgba(255,174,0,0.08);
-      font-size:12px;
-    }
-    .card{
-      padding:var(--pad);
-      border-radius:var(--radius);
-      border:1px solid #232323;
-      background:var(--panel);
-    }
-    .card .card{
-      background:var(--panel2);
-      border:1px solid #2a2a2a;
-      margin-top:10px;
-    }
-    .h{
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
       gap:10px;
-      margin-bottom:8px;
     }
-    .h h2{
-      margin:0;
-      font-size:14px;
-      color:var(--accent);
+    .title .dot{
+      width:10px;height:10px;border-radius:999px;
+      background: var(--accent);
+      box-shadow: 0 0 16px rgba(255,174,0,0.35);
     }
-    label{
-      display:block;
-      font-size:12px;
-      color:var(--muted);
-      margin:10px 0 6px;
+    .pill{
+      display:inline-flex;
+      align-items:center;
+      gap:10px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: linear-gradient(180deg, #1b1b1e, #131315);
+      border: 1px solid rgba(255,174,0,0.35);
+      color: var(--text);
+      cursor:pointer;
+      user-select:none;
+      transition: transform .08s ease, opacity .2s ease, filter .2s ease;
+    }
+    .pill:hover{ transform: translateY(-1px); filter: brightness(1.05); }
+    .pill:active{ transform: translateY(0px); }
+    .pill.disabled{
+      opacity: 0.35;
+      cursor:not-allowed;
+      filter: grayscale(0.2);
+    }
+    .grid{
+      display:grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 14px;
+    }
+    @media (max-width: 980px){
+      .grid{ grid-template-columns: 1fr; }
+    }
+    .panel{
+      background: linear-gradient(180deg, var(--panel), #101012);
+      border: 1px solid rgba(255,174,0,0.18);
+      border-radius: var(--radius);
+      padding: var(--pad);
+      box-shadow: 0 10px 40px rgba(0,0,0,0.35);
+    }
+    .panel h3{
+      margin: 0 0 10px 0;
+      font-size: 13px;
+      color: var(--accent);
+      letter-spacing: .6px;
+      text-transform: uppercase;
+    }
+    .row{
+      display:flex;
+      gap: 10px;
+      align-items:center;
+      flex-wrap: wrap;
     }
     input, textarea, select{
-      width:100%;
-      padding:10px 10px;
-      border-radius:var(--radius);
-      border:1px solid #2c2c2c;
-      background:#0f0f0f;
-      color:var(--text);
-      outline:none;
+      font-family: var(--mono);
+      background: var(--panel2);
+      border: 1px solid rgba(255,174,0,0.18);
+      color: var(--text);
+      border-radius: var(--radius);
+      padding: 10px 11px;
+      outline: none;
+      width: 100%;
     }
-    input:focus, textarea:focus, select:focus{
-      border-color:rgba(255,174,0,0.75);
-      box-shadow:0 0 0 2px rgba(255,174,0,0.12);
-    }
-    textarea{ min-height:140px; resize:vertical; }
-    .row{ display:flex; gap:10px; flex-wrap:wrap; }
-    button{
-      padding:10px 12px;
-      border-radius:var(--radius);
-      border:1px solid #333;
-      background:var(--btn);
-      color:var(--text);
+    textarea{ min-height: 120px; resize: vertical; }
+    .btn{
+      font-family: var(--mono);
+      background: #232326;
+      border: 1px solid rgba(255,174,0,0.35);
+      color: var(--text);
+      border-radius: var(--radius);
+      padding: 10px 12px;
       cursor:pointer;
-      transition: transform .03s ease-in-out, background .12s ease-in-out, border-color .12s ease-in-out;
+      transition: transform .08s ease, filter .2s ease, opacity .2s ease;
+      user-select:none;
     }
-    button:hover{
-      background:var(--btn2);
-      border-color:rgba(255,174,0,0.55);
-    }
-    button:active{ transform: translateY(1px); }
-    button.primary{
-      border-color:rgba(255,174,0,0.75);
-      background:rgba(255,174,0,0.12);
-      color:var(--accent);
-    }
-    button.danger{
-      border-color:rgba(255,77,77,0.6);
-      background:rgba(255,77,77,0.08);
-      color:#ffb3b3;
-    }
-    button:disabled{
-      opacity:0.55;
-      cursor:not-allowed;
-    }
+    .btn:hover{ transform: translateY(-1px); filter: brightness(1.06); }
+    .btn:active{ transform: translateY(0px); }
+    .btn.ghost{ background: transparent; }
+    .btn.danger{ border-color: rgba(255,77,77,0.45); }
+    .btn.disabled{ opacity: .45; cursor:not-allowed; }
+    .muted{ color: var(--muted); font-size: 12px; line-height: 1.35; }
     .kv{
-      font-size:12px;
-      line-height:1.35;
-      color:var(--muted);
-      white-space:pre-wrap;
-      word-break:break-word;
+      display:grid;
+      grid-template-columns: 160px 1fr;
+      gap: 6px 12px;
+      margin-top: 8px;
+      font-size: 12px;
     }
-    .kv b{ color:var(--text); }
+    .kv div:nth-child(odd){ color: var(--muted); }
+    .kv code{
+      color: var(--text);
+      background: rgba(0,0,0,0.25);
+      padding: 2px 6px;
+      border-radius: 6px;
+      border: 1px solid rgba(255,174,0,0.15);
+    }
+    .progress{
+      height: 10px;
+      width: 100%;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,174,0,0.14);
+      overflow:hidden;
+      margin-top: 10px;
+    }
     .bar{
-      height:10px;
-      width:100%;
-      background:#0f0f0f;
-      border:1px solid #2a2a2a;
-      border-radius:999px;
+      height:100%;
+      width: 0%;
+      background: linear-gradient(90deg, rgba(255,174,0,0.20), rgba(255,174,0,0.95));
+      box-shadow: 0 0 18px rgba(255,174,0,0.35);
+      transition: width .25s ease;
+    }
+    .badge{
+      display:inline-flex;
+      align-items:center;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,174,0,0.25);
+      background: rgba(255,174,0,0.08);
+      font-size: 11px;
+      color: var(--accent);
+      margin-left: 8px;
+    }
+    .statusLine{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap: 10px;
+      font-size: 12px;
+      margin-top: 8px;
+    }
+    .statusDot{
+      width:10px;height:10px;border-radius:999px;
+      background: rgba(255,255,255,0.2);
+      box-shadow:none;
+    }
+    .statusDot.ok{ background: var(--ok); box-shadow: 0 0 12px rgba(57,217,138,0.35); }
+    .statusDot.warn{ background: var(--accent); box-shadow: 0 0 12px rgba(255,174,0,0.35); }
+    .statusDot.err{ background: var(--danger); box-shadow: 0 0 12px rgba(255,77,77,0.35); }
+
+    /* Talk view */
+    #talkView{
+      position: fixed;
+      inset: 0;
+      display:none;
+      background: radial-gradient(1100px 800px at 50% 45%, rgba(255,174,0,0.06), rgba(0,0,0,0) 55%),
+                  radial-gradient(900px 700px at 50% 60%, rgba(39,243,255,0.05), rgba(0,0,0,0) 60%),
+                  #050506;
       overflow:hidden;
     }
-    .bar > div{
-      height:100%;
-      width:0%;
-      background:linear-gradient(90deg, rgba(255,174,0,0.25), rgba(255,174,0,0.95));
+    #talkView.active{ display:block; }
+    #exitBtn{
+      position:absolute;
+      top: 14px;
+      left: 14px;
+      width: 42px;
+      height: 42px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,174,0,0.28);
+      background: rgba(20,20,22,0.7);
+      color: var(--text);
+      cursor:pointer;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-size: 18px;
+      line-height: 1;
+      user-select:none;
+      transition: transform .08s ease, filter .2s ease, opacity .2s ease;
+      z-index: 5;
     }
-    .statusline{
-      font-size:12px;
-      color:var(--muted);
-      margin-top:8px;
-      white-space:pre-wrap;
+    #exitBtn:hover{ transform: translateY(-1px); filter: brightness(1.08); }
+    #exitBtn:active{ transform: translateY(0px); }
+    #ringWrap{
+      position:absolute;
+      inset:0;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      opacity: 0;
+      transition: opacity .35s ease;
     }
-    audio{ width:100%; margin-top:8px; }
-    .tiny{ font-size:11px; color:#8a8a8a; }
-    code{
-      padding:2px 6px;
-      border-radius:6px;
-      background:#101010;
-      border:1px solid #222;
-      color:var(--accent);
+    #ringWrap.visible{ opacity: 1; }
+    #ringSvg{
+      width: min(72vh, 78vw);
+      height: min(72vh, 78vw);
+      filter: drop-shadow(0 0 40px rgba(255,174,0,0.08));
     }
-    @media (max-width: 960px){
-      .wrap{ grid-template-columns:1fr; }
+    #ringPath{
+      fill: rgba(0,0,0,0.0);
+      stroke: var(--ring-magenta);
+      stroke-width: 10;
+      stroke-linejoin: round;
+      stroke-linecap: round;
+      opacity: 0.95;
     }
+    #ringHint{
+      position:absolute;
+      bottom: 26px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 12px;
+      color: rgba(255,255,255,0.55);
+      text-align:center;
+      width: min(680px, 90vw);
+      pointer-events:none;
+    }
+    #cascade{
+      position:absolute;
+      left: 50%;
+      bottom: 12%;
+      transform: translateX(-50%);
+      width: min(860px, 92vw);
+      display:flex;
+      flex-direction:column;
+      gap: 6px;
+      align-items:center;
+      pointer-events:none;
+      z-index: 4;
+    }
+    .cascadeItem{
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(18,18,20,0.72);
+      border: 1px solid rgba(255,174,0,0.16);
+      color: rgba(255,255,255,0.92);
+      font-size: 13px;
+      line-height: 1.3;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+      opacity: 0;
+      transform: translateY(10px);
+      animation: riseFade 3.2s ease forwards;
+    }
+    @keyframes riseFade{
+      0%{ opacity: 0; transform: translateY(10px); }
+      12%{ opacity: 0.95; transform: translateY(0px); }
+      80%{ opacity: 0.62; transform: translateY(-6px); }
+      100%{ opacity: 0; transform: translateY(-12px); }
+    }
+
+    .toast{
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      max-width: min(520px, 92vw);
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,174,0,0.24);
+      background: rgba(18,18,20,0.85);
+      color: rgba(255,255,255,0.92);
+      font-size: 12px;
+      z-index: 999;
+      opacity: 0;
+      transform: translateY(8px);
+      transition: opacity .2s ease, transform .2s ease;
+    }
+    .toast.show{ opacity: 1; transform: translateY(0px); }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="title">
-      <h1>PersonaPlex Eval</h1>
-      <div class="badge">VERSION 1.1</div>
-    </div>
-
-    <!-- LEFT: MODEL + TOKEN -->
-    <div class="card">
-      <div class="h">
-        <h2>MODEL / DOWNLOAD</h2>
-        <div class="tiny">auto-download on first run</div>
-      </div>
-
-      <div class="card">
-        <label>Hugging Face Token (stored in browser localStorage; sent as <code>X-HF-Token</code>)</label>
-        <input id="hfToken" type="password" placeholder="hf_..." autocomplete="off" />
-        <div class="row" style="margin-top:10px;">
-          <button class="primary" id="saveToken">Save token</button>
-          <button class="danger" id="clearToken">Clear</button>
+  <div id="setupView">
+    <div class="wrap">
+      <div class="topbar">
+        <div class="title"><span class="dot"></span> PersonaPlex Eval</div>
+        <div class="pill disabled" id="startTalkingBtn" title="Download + load model first">
+          Start Talking
+          <span class="badge" id="startBadge">locked</span>
         </div>
-        <div class="statusline" id="tokenNote"></div>
       </div>
 
-      <div class="card">
-        <div class="row" style="justify-content:space-between; align-items:center;">
-          <div class="kv" id="modelId"></div>
-          <div class="row">
-            <button id="refresh">Refresh</button>
-            <button class="primary" id="download">Download model</button>
+      <div class="grid">
+        <div class="panel">
+          <h3>Hugging Face Access</h3>
+          <div class="muted">
+            PersonaPlex is gated. Paste your HF token (after accepting the model terms) — it is stored only in server memory for this session.
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <input id="hfToken" type="password" placeholder="HF_TOKEN (not stored in browser)"/>
+            <button class="btn" id="saveTokenBtn">Save Token</button>
+            <button class="btn ghost danger" id="clearTokenBtn">Clear</button>
+          </div>
+          <div class="statusLine">
+            <div class="row" style="gap:8px;">
+              <div class="statusDot warn" id="tokenDot"></div>
+              <div id="tokenStatus">token: unknown</div>
+            </div>
+            <div class="muted" id="repoLine"></div>
           </div>
         </div>
 
-        <label>Download progress</label>
-        <div class="bar"><div id="prog"></div></div>
-        <div class="statusline" id="dlLine"></div>
+        <div class="panel">
+          <h3>Model Download</h3>
+          <div class="muted">Downloads model weights into your Hugging Face cache. Auto-download triggers once token is saved.</div>
 
-        <div class="kv" id="modelStats" style="margin-top:10px;"></div>
-      </div>
-    </div>
-
-    <!-- RIGHT: AUDIO + INFERENCE -->
-    <div class="card">
-      <div class="h">
-        <h2>OFFLINE INFERENCE</h2>
-        <div class="tiny">mic → 24kHz wav → moshi.offline</div>
-      </div>
-
-      <div class="card">
-        <div class="row">
-          <div style="flex:1; min-width:260px;">
-            <label>Voice</label>
-            <select id="voice"></select>
+          <div class="kv">
+            <div>Repo</div><div><code id="repoCode"></code></div>
+            <div>Status</div><div><code id="dlStatus"></code></div>
+            <div>Cache bytes</div><div><code id="cacheBytes"></code></div>
+            <div>Files</div><div><code id="fileCount"></code></div>
           </div>
-          <div style="flex:1; min-width:260px;">
-            <label>Seed</label>
-            <input id="seed" value="42424242" />
+
+          <div class="progress"><div class="bar" id="dlBar"></div></div>
+          <div class="statusLine">
+            <div class="row" style="gap:8px;">
+              <div class="statusDot warn" id="dlDot"></div>
+              <div id="dlMsg">…</div>
+            </div>
+            <div class="muted" id="dlPct"></div>
+          </div>
+
+          <div class="row" style="margin-top:10px; justify-content:space-between;">
+            <button class="btn" id="downloadBtn">Download / Resume</button>
+            <button class="btn" id="loadBtn">Load Into GPU</button>
+          </div>
+
+          <div class="muted" id="errBox" style="margin-top:10px; color: rgba(255,77,77,0.95); display:none;"></div>
+        </div>
+
+        <div class="panel">
+          <h3>Persona Prompts</h3>
+          <div class="muted">PersonaPlex is conditioned on a voice prompt (audio tokens) and a text prompt (role/persona context).</div>
+
+          <div class="row" style="margin-top:10px;">
+            <select id="voiceSelect"></select>
+          </div>
+
+          <div class="row" style="margin-top:10px;">
+            <textarea id="textPrompt" placeholder="Text prompt (role/persona), e.g.:
+You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way."></textarea>
+          </div>
+
+          <div class="row" style="margin-top:10px; justify-content:space-between;">
+            <button class="btn" id="savePromptBtn">Save Prompt Settings</button>
+            <div class="muted">Saved locally (except HF token).</div>
           </div>
         </div>
 
-        <label>Role / text prompt (optional)</label>
-        <textarea id="prompt" placeholder="You are a wise and friendly teacher..."></textarea>
-      </div>
-
-      <div class="card">
-        <div class="row">
-          <button id="start">Start recording</button>
-          <button id="stop" disabled>Stop</button>
-          <button class="primary" id="send" disabled>Send to PersonaPlex</button>
+        <div class="panel">
+          <h3>Notes</h3>
+          <div class="muted">
+            • Microphone works on <code>localhost</code> even on HTTP (secure context exception).<br/>
+            • For best results you want a GPU (A100/H100-class recommended for real-time).<br/>
+            • Audio is streamed at <code>24kHz</code> in <code>80ms</code> frames (matching Mimi streaming constraints).<br/>
+          </div>
         </div>
-
-        <label>Input (recorded)</label>
-        <audio id="inAudio" controls></audio>
-
-        <label>Output (model)</label>
-        <audio id="outAudio" controls></audio>
-
-        <div class="statusline" id="runLine">Idle.</div>
       </div>
     </div>
   </div>
 
+  <div id="talkView">
+    <div id="exitBtn" title="Back to setup">✕</div>
+    <div id="ringWrap">
+      <svg id="ringSvg" viewBox="0 0 1000 1000" aria-label="FFT ring">
+        <path id="ringPath"></path>
+      </svg>
+      <div id="ringHint">Listening + speaking (full duplex). Magenta = mic energy. Teal = model energy.</div>
+    </div>
+    <div id="cascade"></div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
 <script>
-const LS_TOKEN_KEY = "pp_hf_token_v1";
+(() => {
+  const $ = (id) => document.getElementById(id);
 
-const hfTokenEl = document.getElementById("hfToken");
-const saveTokenBtn = document.getElementById("saveToken");
-const clearTokenBtn = document.getElementById("clearToken");
-const tokenNote = document.getElementById("tokenNote");
+  const startBtn = $("startTalkingBtn");
+  const startBadge = $("startBadge");
+  const repoCode = $("repoCode");
+  const repoLine = $("repoLine");
+  const dlStatus = $("dlStatus");
+  const cacheBytes = $("cacheBytes");
+  const fileCount = $("fileCount");
+  const dlBar = $("dlBar");
+  const dlMsg = $("dlMsg");
+  const dlPct = $("dlPct");
+  const dlDot = $("dlDot");
+  const tokenDot = $("tokenDot");
+  const tokenStatus = $("tokenStatus");
+  const errBox = $("errBox");
 
-const modelIdEl = document.getElementById("modelId");
-const refreshBtn = document.getElementById("refresh");
-const downloadBtn = document.getElementById("download");
-const progEl = document.getElementById("prog");
-const dlLine = document.getElementById("dlLine");
-const modelStats = document.getElementById("modelStats");
+  const voiceSelect = $("voiceSelect");
+  const textPrompt = $("textPrompt");
 
-const voiceSel = document.getElementById("voice");
-const seedEl = document.getElementById("seed");
-const promptEl = document.getElementById("prompt");
+  const setupView = $("setupView");
+  const talkView = $("talkView");
+  const exitBtn = $("exitBtn");
+  const ringWrap = $("ringWrap");
+  const ringPath = $("ringPath");
+  const cascade = $("cascade");
+  const toast = $("toast");
 
-const startBtn = document.getElementById("start");
-const stopBtn = document.getElementById("stop");
-const sendBtn = document.getElementById("send");
-const inAudio = document.getElementById("inAudio");
-const outAudio = document.getElementById("outAudio");
-const runLine = document.getElementById("runLine");
+  const saved = {
+    voice: localStorage.getItem("pp_voice") || "",
+    text: localStorage.getItem("pp_text") || "You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way.",
+    temp: parseFloat(localStorage.getItem("pp_temp") || "0.8"),
+    temp_text: parseFloat(localStorage.getItem("pp_temp_text") || "0.7"),
+  };
+  textPrompt.value = saved.text;
 
-let lastStatus = null;
-let statusTimer = null;
-
-function fmtMB(x){
-  if (x === null || x === undefined) return "—";
-  return (Math.round(x * 100) / 100).toFixed(2) + " MB";
-}
-function fmtBytes(n){
-  if (n === null || n === undefined) return "—";
-  const units = ["B","KB","MB","GB","TB"];
-  let i = 0, v = n;
-  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-  return v.toFixed(i === 0 ? 0 : 2) + " " + units[i];
-}
-
-function getToken(){
-  return (localStorage.getItem(LS_TOKEN_KEY) || "").trim();
-}
-function setToken(tok){
-  localStorage.setItem(LS_TOKEN_KEY, tok.trim());
-}
-function clearToken(){
-  localStorage.removeItem(LS_TOKEN_KEY);
-}
-
-function tokenBanner(){
-  const tok = getToken();
-  if (tok){
-    tokenNote.textContent = "Token saved locally. It will be sent to this server only when you press Download/Run.";
-  } else {
-    tokenNote.textContent = "No token saved. Enter token to enable download + stats.";
-  }
-}
-
-async function apiStatus(){
-  const tok = getToken();
-  const headers = {};
-  if (tok) headers["X-HF-Token"] = tok;
-  const r = await fetch("/api/model/status", { headers });
-  return await r.json();
-}
-
-async function apiDownload(){
-  const tok = getToken();
-  if (!tok) throw new Error("No HF token saved.");
-  const r = await fetch("/api/model/download", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-HF-Token": tok },
-    body: JSON.stringify({ hf_token: tok })
-  });
-  return await r.json();
-}
-
-async function refreshStatus(){
-  const j = await apiStatus();
-  lastStatus = j;
-
-  modelIdEl.textContent = "repo_id: " + (j.repo_id || "—");
-  const ready = !!j.ready;
-  const state = j.state || "—";
-
-  const pct = (j.percent === null || j.percent === undefined) ? null : j.percent;
-  progEl.style.width = (pct === null ? (ready ? "100%" : "0%") : Math.max(0, Math.min(100, pct)).toFixed(2) + "%");
-
-  const dlMb = j.downloaded_mb;
-  const totalMb = j.total_mb;
-
-  const lineParts = [];
-  lineParts.push("state=" + state);
-  if (pct !== null) lineParts.push("progress=" + pct.toFixed(2) + "%");
-  lineParts.push("downloaded=" + fmtMB(dlMb));
-  if (totalMb !== null && totalMb !== undefined) lineParts.push("total=" + fmtMB(totalMb));
-  if (ready) lineParts.push("READY");
-
-  dlLine.textContent = lineParts.join(" • ");
-
-  modelStats.textContent =
-    "cache_model_dir: " + (j.cache_model_dir || "—") + "\n" +
-    "hf_home: " + (j.hf_home || "—") + "\n" +
-    "hf_hub_cache: " + (j.hf_hub_cache || "—") + "\n" +
-    "snapshots: " + ((j.snapshots && j.snapshots.length) ? j.snapshots.join(", ") : "—") + "\n" +
-    "downloaded_bytes: " + fmtBytes(j.downloaded_bytes) + "\n" +
-    "total_bytes: " + fmtBytes(j.total_bytes) + "\n" +
-    (j.last_error ? ("last_error: " + j.last_error) : "");
-
-  // Gate inference buttons on readiness
-  startBtn.disabled = !ready;
-  if (!ready){
-    stopBtn.disabled = true;
-    sendBtn.disabled = true;
+  function fmtBytes(n){
+    n = Number(n||0);
+    const units = ["B","KB","MB","GB","TB"];
+    let u = 0;
+    while(n >= 1024 && u < units.length-1){ n/=1024; u++; }
+    return `${n.toFixed(u===0?0:2)} ${units[u]}`;
   }
 
-  // Download button enabled when token exists and not ready
-  const tok = getToken();
-  downloadBtn.disabled = !tok || ready;
+  let status = null;
+  let ws = null;
 
-  return j;
-}
-
-async function ensureAutoDownload(){
-  // Auto download on first run IF token exists and model not ready
-  const tok = getToken();
-  if (!tok) return;
-  const st = await refreshStatus();
-  if (!st.ready && st.state !== "downloading"){
-    await apiDownload().catch(()=>{});
+  function showToast(msg){
+    toast.textContent = msg;
+    toast.classList.add("show");
+    setTimeout(() => toast.classList.remove("show"), 2400);
   }
-}
 
-async function loadVoices(){
-  const r = await fetch("/api/voices");
-  const j = await r.json();
-  voiceSel.innerHTML = "";
-  (j.voices || []).forEach(v=>{
-    const o = document.createElement("option");
-    o.value = v;
-    o.textContent = v;
-    voiceSel.appendChild(o);
-  });
-  if (j.voices && j.voices.includes("NATF2")) voiceSel.value = "NATF2";
-}
-
-saveTokenBtn.onclick = () => {
-  setToken(hfTokenEl.value || "");
-  tokenBanner();
-  refreshStatus().catch(()=>{});
-};
-clearTokenBtn.onclick = () => {
-  clearToken();
-  hfTokenEl.value = "";
-  tokenBanner();
-  refreshStatus().catch(()=>{});
-};
-refreshBtn.onclick = () => refreshStatus().catch(e => dlLine.textContent = "status error: " + e);
-downloadBtn.onclick = async () => {
-  try{
-    dlLine.textContent = "Starting download...";
-    await apiDownload();
-  }catch(e){
-    dlLine.textContent = "download error: " + e;
+  async function postJSON(url, body){
+    const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body||{})});
+    const j = await r.json().catch(()=> ({}));
+    if(!r.ok) throw new Error(j.error || j.message || `HTTP ${r.status}`);
+    return j;
   }
-};
 
-function startPolling(){
-  if (statusTimer) clearInterval(statusTimer);
-  statusTimer = setInterval(()=>refreshStatus().catch(()=>{}), 1000);
-}
-
-/**
- * Mic capture -> Float32 PCM -> resample to 24000 Hz -> encode 16-bit PCM WAV
- */
-function resampleLinear(input, inRate, outRate) {
-  if (inRate === outRate) return input;
-  const ratio = inRate / outRate;
-  const outLength = Math.floor(input.length / ratio);
-  const out = new Float32Array(outLength);
-  for (let i = 0; i < outLength; i++) {
-    const t = i * ratio;
-    const i0 = Math.floor(t);
-    const i1 = Math.min(i0 + 1, input.length - 1);
-    const frac = t - i0;
-    out[i] = input[i0] * (1 - frac) + input[i1] * frac;
+  function setDot(dotEl, kind){
+    dotEl.classList.remove("ok","warn","err");
+    dotEl.classList.add(kind);
   }
-  return out;
-}
-function floatTo16BitPCM(f32) {
-  const out = new Int16Array(f32.length);
-  for (let i = 0; i < f32.length; i++) {
-    let s = Math.max(-1, Math.min(1, f32[i]));
-    out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+
+  function setStartEnabled(enabled){
+    startBtn.classList.toggle("disabled", !enabled);
+    startBadge.textContent = enabled ? "ready" : "locked";
+    startBadge.style.opacity = enabled ? "1" : "0.8";
   }
-  return out;
-}
-function writeWavMono16(pcm16, sampleRate) {
-  const bytesPerSample = 2;
-  const blockAlign = bytesPerSample * 1;
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = pcm16.length * bytesPerSample;
-  const buf = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buf);
 
-  function writeStr(off, s) { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); }
+  async function refresh(){
+    const r = await fetch("/api/status", {cache:"no-store"});
+    status = await r.json();
+    repoCode.textContent = status.repo_id || "";
+    repoLine.textContent = `repo: ${status.repo_id || ""}`;
 
-  writeStr(0, 'RIFF');
-  view.setUint32(4, 36 + dataSize, true);
-  writeStr(8, 'WAVE');
+    // Token status
+    tokenStatus.textContent = status.has_token ? "token: present" : "token: missing";
+    setDot(tokenDot, status.has_token ? "ok" : "warn");
 
-  writeStr(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, byteRate, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, 16, true);
+    // Download status
+    dlStatus.textContent = status.status || "";
+    cacheBytes.textContent = fmtBytes(status.hf_cache_bytes_estimate || 0);
+    fileCount.textContent = `${status.files_done||0}/${status.files_total||0}`;
 
-  writeStr(36, 'data');
-  view.setUint32(40, dataSize, true);
+    const pct = Math.round((status.pct||0)*100);
+    dlBar.style.width = `${pct}%`;
+    dlPct.textContent = status.total_bytes ? `${pct}% (${fmtBytes(status.done_bytes)} / ${fmtBytes(status.total_bytes)})` : `${pct}%`;
+    dlMsg.textContent = status.message || "";
+    errBox.style.display = "none";
 
-  let offset = 44;
-  for (let i = 0; i < pcm16.length; i++, offset += 2) view.setInt16(offset, pcm16[i], true);
+    if(status.status === "ready"){
+      setDot(dlDot, "ok");
+    } else if(status.status === "error"){
+      setDot(dlDot, "err");
+      if(status.last_error){
+        errBox.style.display = "block";
+        errBox.textContent = `Download error: ${status.last_error}`;
+      }
+    } else {
+      setDot(dlDot, "warn");
+    }
 
-  return new Blob([buf], { type: 'audio/wav' });
-}
+    // Voices
+    const voices = status.voices || [];
+    const defaultVoice = status.default_voice || "";
+    if(voiceSelect.options.length === 0 && voices.length){
+      voiceSelect.innerHTML = "";
+      for(const v of voices){
+        const opt = document.createElement("option");
+        opt.value = v;
+        opt.textContent = v;
+        voiceSelect.appendChild(opt);
+      }
+      const pick = saved.voice && voices.includes(saved.voice) ? saved.voice : defaultVoice;
+      if(pick) voiceSelect.value = pick;
+    }
 
-let audioCtx = null;
-let mediaStream = null;
-let processor = null;
-let chunks = [];
-let recordedBlob = null;
-let inputSampleRate = 48000;
+    // Load status
+    if(status.model_error){
+      errBox.style.display = "block";
+      errBox.textContent = `Model load error: ${status.model_error}`;
+    }
 
-async function startRecording() {
-  recordedBlob = null;
-  outAudio.src = "";
-  inAudio.src = "";
-  runLine.textContent = "Recording...";
-  chunks = [];
+    const readyToTalk = (status.status === "ready") && (status.model_loaded === true);
+    setStartEnabled(readyToTalk);
+  }
 
-  mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  inputSampleRate = audioCtx.sampleRate;
+  // Auto-refresh loop
+  setInterval(refresh, 900);
+  refresh();
 
-  const source = audioCtx.createMediaStreamSource(mediaStream);
-  processor = audioCtx.createScriptProcessor(4096, 1, 1);
-  processor.onaudioprocess = (e) => {
-    const input = e.inputBuffer.getChannelData(0);
-    chunks.push(new Float32Array(input));
+  // Buttons
+  $("saveTokenBtn").onclick = async () => {
+    const t = $("hfToken").value.trim();
+    if(!t) return showToast("Paste your HF token first.");
+    try{
+      await postJSON("/api/set_token", {token: t});
+      $("hfToken").value = "";
+      showToast("Token saved (server-side). Auto-download started.");
+      await refresh();
+    }catch(e){
+      showToast(`Token save failed: ${e.message}`);
+    }
+  };
+  $("clearTokenBtn").onclick = async () => {
+    await postJSON("/api/clear_token", {});
+    showToast("Token cleared.");
+    await refresh();
+  };
+  $("downloadBtn").onclick = async () => {
+    try{
+      await postJSON("/api/start_download", {repo_id: (status && status.repo_id) || ""});
+      showToast("Download/resume requested.");
+      await refresh();
+    }catch(e){
+      showToast(`Download failed to start: ${e.message}`);
+    }
+  };
+  $("loadBtn").onclick = async () => {
+    try{
+      const j = await postJSON("/api/load_model", {repo_id: (status && status.repo_id) || ""});
+      showToast(j.ok ? j.message : `Load failed: ${j.message}`);
+      await refresh();
+    }catch(e){
+      showToast(`Load failed: ${e.message}`);
+    }
+  };
+  $("savePromptBtn").onclick = () => {
+    localStorage.setItem("pp_voice", voiceSelect.value || "");
+    localStorage.setItem("pp_text", textPrompt.value || "");
+    showToast("Prompt settings saved locally.");
   };
 
-  source.connect(processor);
-  processor.connect(audioCtx.destination);
+  // --- Talk mode (live duplex) ---
+  let audioCtx = null;
+  let micStream = null;
+  let micSource = null;
+  let micAnalyser = null;
 
-  startBtn.disabled = true;
-  stopBtn.disabled = false;
-  sendBtn.disabled = true;
-}
+  let outAnalyser = null;
+  let scriptNodeIn = null;
+  let scriptNodeOut = null;
 
-async function stopRecording() {
-  stopBtn.disabled = true;
-  startBtn.disabled = false;
+  // output jitter queue in float32
+  let outQ = [];
+  let outQMax = 24000 * 3; // 3 seconds buffer cap
 
-  if (processor) processor.disconnect();
-  if (audioCtx) await audioCtx.close();
-  if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+  // visualization
+  let raf = 0;
+  const fftBins = 256;
+  let micFFT = new Uint8Array(fftBins);
+  let outFFT = new Uint8Array(fftBins);
 
-  let total = 0;
-  for (const c of chunks) total += c.length;
-  const mono = new Float32Array(total);
-  let o = 0;
-  for (const c of chunks) { mono.set(c, o); o += c.length; }
-
-  const targetRate = 24000;
-  const resampled = resampleLinear(mono, inputSampleRate, targetRate);
-  const pcm16 = floatTo16BitPCM(resampled);
-  recordedBlob = writeWavMono16(pcm16, targetRate);
-
-  inAudio.src = URL.createObjectURL(recordedBlob);
-  sendBtn.disabled = false;
-  runLine.textContent = "Recorded @ 24kHz. Ready to send.";
-}
-
-async function sendToServer() {
-  if (!recordedBlob) return;
-
-  // Ensure model is ready
-  const st = await refreshStatus();
-  if (!st.ready){
-    runLine.textContent = "Model not ready. Download first (token required).";
-    return;
+  function downsampleFloat32(src, srcRate, dstRate){
+    if(dstRate === srcRate) return src;
+    const ratio = srcRate / dstRate;
+    const dstLen = Math.floor(src.length / ratio);
+    const dst = new Float32Array(dstLen);
+    let pos = 0;
+    for(let i=0;i<dstLen;i++){
+      const p = i * ratio;
+      const p0 = Math.floor(p);
+      const p1 = Math.min(src.length-1, p0+1);
+      const frac = p - p0;
+      dst[i] = src[p0]*(1-frac) + src[p1]*frac;
+    }
+    return dst;
   }
 
-  runLine.textContent = "Running moshi.offline...";
-  sendBtn.disabled = true;
-
-  const fd = new FormData();
-  fd.append("audio", recordedBlob, "input.wav");
-  fd.append("voice", voiceSel.value);
-  fd.append("seed", seedEl.value || "42424242");
-  fd.append("text_prompt", promptEl.value || "");
-
-  const tok = getToken();
-  const headers = {};
-  if (tok) headers["X-HF-Token"] = tok;
-
-  const r = await fetch("/api/offline", { method:"POST", body: fd, headers });
-  const j = await r.json();
-
-  if (!j.ok){
-    runLine.textContent = "Error: " + (j.error || "unknown") + (j.details ? ("\n" + j.details) : "");
-    sendBtn.disabled = false;
-    return;
+  function pcm16ToFloat32(bytes){
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const n = bytes.byteLength / 2;
+    const out = new Float32Array(n);
+    for(let i=0;i<n;i++){
+      out[i] = dv.getInt16(i*2, true) / 32768.0;
+    }
+    return out;
   }
 
-  outAudio.src = j.output_wav_url;
-  runLine.textContent = "Done. Output: " + j.output_wav_url;
-  sendBtn.disabled = false;
-}
+  function float32ToPCM16(f32){
+    const out = new Int16Array(f32.length);
+    for(let i=0;i<f32.length;i++){
+      let v = Math.max(-1, Math.min(1, f32[i]));
+      out[i] = (v * 32767) | 0;
+    }
+    return new Uint8Array(out.buffer);
+  }
 
-startBtn.onclick = () => startRecording().catch(e => runLine.textContent = "Mic error: " + e);
-stopBtn.onclick  = () => stopRecording().catch(e => runLine.textContent = "Stop error: " + e);
-sendBtn.onclick  = () => sendToServer().catch(e => runLine.textContent = "Send error: " + e);
+  function energyFromFFT(arr){
+    let s = 0;
+    for(let i=0;i<arr.length;i++){
+      const v = arr[i]/255;
+      s += v*v;
+    }
+    return Math.sqrt(s / arr.length);
+  }
 
-(async function init(){
-  // populate token input from localStorage
-  hfTokenEl.value = getToken();
-  tokenBanner();
+  function buildRingPathFromFFT(freq, cx, cy, baseR){
+    const N = 240;
+    const amp = baseR * 0.20;
+    let d = "";
+    for(let i=0;i<N;i++){
+      const a = (i / N) * Math.PI * 2;
+      const bin = Math.floor((i / N) * (freq.length-1));
+      const v = freq[bin] / 255;
+      const r = baseR + amp * Math.pow(v, 1.35);
+      const x = cx + r * Math.cos(a);
+      const y = cy + r * Math.sin(a);
+      d += (i===0 ? `M ${x.toFixed(2)} ${y.toFixed(2)}` : ` L ${x.toFixed(2)} ${y.toFixed(2)}`);
+    }
+    d += " Z";
+    return d;
+  }
 
-  await loadVoices().catch(()=>{});
-  await refreshStatus().catch(()=>{});
-  startPolling();
-  await ensureAutoDownload().catch(()=>{});
+  function startViz(){
+    cancelAnimationFrame(raf);
+    const baseR = 330;
+    const cx = 500, cy = 500;
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+
+      if(micAnalyser){
+        micAnalyser.getByteFrequencyData(micFFT);
+      } else {
+        micFFT.fill(0);
+      }
+      if(outAnalyser){
+        outAnalyser.getByteFrequencyData(outFFT);
+      } else {
+        outFFT.fill(0);
+      }
+
+      const micE = energyFromFFT(micFFT);
+      const outE = energyFromFFT(outFFT);
+
+      const useOut = outE > micE && outE > 0.06;
+      const useMic = micE >= outE && micE > 0.04;
+
+      let active = null;
+      if(useOut) active = "out";
+      else if(useMic) active = "mic";
+
+      const freq = active === "out" ? outFFT : micFFT;
+      const stroke = 10 + 18 * Math.min(1, (active==="out"?outE:micE));
+      ringPath.setAttribute("d", buildRingPathFromFFT(freq, cx, cy, baseR));
+      ringPath.style.strokeWidth = stroke.toFixed(2);
+
+      if(active === "out") ringPath.style.stroke = getComputedStyle(document.documentElement).getPropertyValue("--ring-teal").trim();
+      else if(active === "mic") ringPath.style.stroke = getComputedStyle(document.documentElement).getPropertyValue("--ring-magenta").trim();
+      else ringPath.style.stroke = "rgba(255,255,255,0.18)";
+    };
+    tick();
+  }
+
+  function stopViz(){
+    cancelAnimationFrame(raf);
+    raf = 0;
+  }
+
+  function addCascadeText(txt){
+    const t = (txt || "").trim();
+    if(!t) return;
+    const div = document.createElement("div");
+    div.className = "cascadeItem";
+    div.textContent = t;
+    cascade.appendChild(div);
+    // prune
+    setTimeout(() => {
+      if(div && div.parentNode) div.parentNode.removeChild(div);
+    }, 3400);
+  }
+
+  async function startTalking(){
+    // Safety checks
+    if(!status || status.status !== "ready" || status.model_loaded !== true){
+      showToast("Model not ready. Download + load first.");
+      return;
+    }
+
+    // Save prompt settings
+    localStorage.setItem("pp_voice", voiceSelect.value || "");
+    localStorage.setItem("pp_text", textPrompt.value || "");
+
+    // Switch view
+    talkView.classList.add("active");
+    ringWrap.classList.remove("visible");
+    cascade.innerHTML = "";
+
+    // Start audio
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const sr = audioCtx.sampleRate;
+
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
+    });
+
+    micSource = audioCtx.createMediaStreamSource(micStream);
+    micAnalyser = audioCtx.createAnalyser();
+    micAnalyser.fftSize = fftBins * 2;
+    micAnalyser.smoothingTimeConstant = 0.85;
+    micSource.connect(micAnalyser);
+
+    // Output chain: ScriptProcessor pulls from outQ and drives an analyser for the ring.
+    outAnalyser = audioCtx.createAnalyser();
+    outAnalyser.fftSize = fftBins * 2;
+    outAnalyser.smoothingTimeConstant = 0.82;
+
+    scriptNodeOut = audioCtx.createScriptProcessor(2048, 1, 1);
+    scriptNodeOut.onaudioprocess = (e) => {
+      const out = e.outputBuffer.getChannelData(0);
+      const need = out.length;
+      for(let i=0;i<need;i++){
+        out[i] = outQ.length ? outQ.shift() : 0.0;
+      }
+    };
+    scriptNodeOut.connect(outAnalyser);
+    outAnalyser.connect(audioCtx.destination);
+
+    // WebSocket connect
+    const proto = (location.protocol === "https:") ? "wss://" : "ws://";
+    const wsUrl = proto + location.host + "/ws/live";
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = "arraybuffer";
+
+    const cfg = {
+      type: "config",
+      text_prompt: localStorage.getItem("pp_text") || "",
+      voice: localStorage.getItem("pp_voice") || "",
+      temp: saved.temp,
+      temp_text: saved.temp_text
+    };
+
+    let serverFrameSize = 1920;
+    let outSampleRate = 24000;
+
+    // mic capture: use ScriptProcessor for simplicity, downsample to 24k, frame to serverFrameSize
+    let micProc = audioCtx.createScriptProcessor(2048, 1, 1);
+    let micBuf24 = [];
+    let micBufLen = 0;
+
+    function pushMic24(f32){
+      for(let i=0;i<f32.length;i++){
+        micBuf24.push(f32[i]);
+      }
+      micBufLen += f32.length;
+    }
+
+    function popFrame24(n){
+      if(micBufLen < n) return null;
+      const frame = new Float32Array(n);
+      for(let i=0;i<n;i++){
+        frame[i] = micBuf24[i];
+      }
+      micBuf24 = micBuf24.slice(n);
+      micBufLen -= n;
+      return frame;
+    }
+
+    micProc.onaudioprocess = (e) => {
+      if(!ws || ws.readyState !== 1) return;
+      const input = e.inputBuffer.getChannelData(0);
+      const down = downsampleFloat32(input, sr, 24000);
+      pushMic24(down);
+      while(true){
+        const fr = popFrame24(serverFrameSize);
+        if(!fr) break;
+        const pcm = float32ToPCM16(fr);
+        const pkt = new Uint8Array(1 + pcm.byteLength);
+        pkt[0] = 0x01;
+        pkt.set(pcm, 1);
+        ws.send(pkt);
+      }
+    };
+
+    micSource.connect(micProc);
+    // do not connect micProc to destination (avoid feedback)
+    // micProc.connect(audioCtx.destination); // intentionally omitted
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify(cfg));
+      showToast("Connected. Streaming…");
+    };
+
+    ws.onmessage = (ev) => {
+      if(typeof ev.data === "string"){
+        let j = null;
+        try{ j = JSON.parse(ev.data); }catch(_){}
+        if(!j) return;
+        if(j.type === "ready"){
+          serverFrameSize = j.frame_size || 1920;
+          outSampleRate = j.sample_rate || 24000;
+          ringWrap.classList.add("visible");
+          startViz();
+        } else if(j.type === "need_load"){
+          showToast(j.message || "Model needs load.");
+          addCascadeText("Backend says: model not loaded. Go back and click 'Load Into GPU'.");
+        } else if(j.type === "text"){
+          if(j.delta) addCascadeText(j.delta);
+        } else if(j.type === "error"){
+          showToast("Error: " + (j.error || "unknown"));
+          addCascadeText("Error: " + (j.error || "unknown"));
+        }
+        return;
+      }
+
+      // binary audio: 0x02 + pcm16 @ 24kHz
+      const u8 = new Uint8Array(ev.data);
+      if(!u8.length) return;
+      if(u8[0] !== 0x02) return;
+      const pcmBytes = u8.slice(1);
+      const f32_24 = pcm16ToFloat32(pcmBytes);
+
+      // resample from 24k to audioCtx sampleRate
+      const f32 = downsampleFloat32(f32_24, 24000, sr);
+
+      // push to output queue
+      for(let i=0;i<f32.length;i++){
+        outQ.push(f32[i]);
+      }
+      if(outQ.length > outQMax){
+        outQ = outQ.slice(outQ.length - outQMax);
+      }
+    };
+
+    ws.onclose = () => {
+      showToast("Disconnected.");
+    };
+
+    ws.onerror = () => {
+      showToast("WebSocket error.");
+    };
+
+    // exit handler
+    exitBtn.onclick = () => stopTalking();
+    startViz();
+  }
+
+  function stopTalking(){
+    // stop ws + audio
+    try{ if(ws) ws.close(); }catch(_){}
+    ws = null;
+
+    stopViz();
+
+    try{
+      if(scriptNodeIn) scriptNodeIn.disconnect();
+      scriptNodeIn = null;
+    }catch(_){}
+
+    try{
+      if(scriptNodeOut) scriptNodeOut.disconnect();
+      scriptNodeOut = null;
+    }catch(_){}
+
+    try{
+      if(micSource) micSource.disconnect();
+      micSource = null;
+    }catch(_){}
+
+    try{
+      if(micStream){
+        for(const tr of micStream.getTracks()) tr.stop();
+        micStream = null;
+      }
+    }catch(_){}
+
+    try{
+      if(audioCtx){
+        audioCtx.close();
+        audioCtx = null;
+      }
+    }catch(_){}
+
+    outQ = [];
+    talkView.classList.remove("active");
+    ringWrap.classList.remove("visible");
+    cascade.innerHTML = "";
+  }
+
+  startBtn.onclick = async () => {
+    if(startBtn.classList.contains("disabled")){
+      showToast("Start Talking is locked (download + load first).");
+      return;
+    }
+    try{
+      await startTalking();
+    }catch(e){
+      showToast("Start failed: " + (e.message || e));
+      addCascadeText("Start failed: " + (e.message || e));
+      stopTalking();
+    }
+  };
+
 })();
 </script>
 </body>
 </html>
 """
 
-def _run(cmd, cwd=None, env=None):
-    print(f"\n$ {' '.join(map(str, cmd))}")
-    subprocess.run(cmd, cwd=cwd, env=env, check=True)
-
-def _check_dep(name):
-    if shutil.which(name) is None:
-        raise SystemExit(f"Missing dependency '{name}'. Please install it and re-run.")
-
-def _venv_python(venv_dir: Path) -> Path:
-    if os.name == "nt":
-        return venv_dir / "Scripts" / "python.exe"
-    return venv_dir / "bin" / "python"
 
 def main():
-    ap = argparse.ArgumentParser(
-        formatter_class=argparse.RawTextHelpFormatter,
-        description="Bootstrap + run a Flask demo for NVIDIA PersonaPlex (moshi.offline) with UI token ingress + model download stats.",
-    )
-    ap.add_argument("--dir", default="./personaplex_flask_demo", help="Working directory")
-    ap.add_argument("--host", default="127.0.0.1", help="Flask bind host")
-    ap.add_argument("--port", default="5000", help="Flask bind port")
-    ap.add_argument("--model", default=DEFAULT_MODEL_REPO_ID, help="HF model repo id (default: nvidia/personaplex-7b-v1)")
-    ap.add_argument("--no-run", action="store_true", help="Only bootstrap; do not run Flask")
-    args = ap.parse_args()
+    ensure_venv_and_deps()
+    ensure_personaplex_repo()
+    ensure_personaplex_moshi_installed()
 
-    if sys.version_info < (3, 9):
-        raise SystemExit("Python 3.9+ recommended for this demo.")
+    # Discover voice prompts from repo
+    global VOICE_PROMPTS
+    VOICE_PROMPTS = find_voice_prompts(PERSONAPLEX_DIR)
+    if not VOICE_PROMPTS:
+        print("Warning: no NAT*/VAR*.pt voice prompts found in repo. Voice conditioning may be unavailable.")
 
-    _check_dep("git")
+    app = create_app()
 
-    workdir = Path(args.dir).expanduser().resolve()
-    repo_dir = workdir / "personaplex"
-    venv_dir = workdir / ".venv"
-    demo_dir = workdir / "flask_demo"
-    templates_dir = demo_dir / "templates"
-    results_dir = demo_dir / "results"
+    # Run with gevent + gevent-websocket for real WebSocket support.
+    from gevent import pywsgi
+    from geventwebsocket.handler import WebSocketHandler
 
-    workdir.mkdir(parents=True, exist_ok=True)
+    print("\nPersonaPlex Eval server running:")
+    print(f"  http://{HOST}:{PORT}")
+    print("Open that in your browser.\n")
 
-    # 1) Clone or update repo
-    if not (repo_dir / ".git").exists():
-        print("[1/6] Cloning NVIDIA/personaplex...")
-        _run(["git", "clone", REPO_URL, str(repo_dir)], cwd=str(workdir))
-    else:
-        print("[1/6] Updating existing repo...")
-        try:
-            _run(["git", "pull", "--ff-only"], cwd=str(repo_dir))
-        except subprocess.CalledProcessError:
-            print("Warning: git pull failed; continuing with existing checkout.")
+    server = pywsgi.WSGIServer((HOST, PORT), app, handler_class=WebSocketHandler)
+    server.serve_forever()
 
-    # 2) Create venv
-    print("[2/6] Creating venv...")
-    if not venv_dir.exists():
-        venv.EnvBuilder(with_pip=True, clear=False).create(str(venv_dir))
-
-    py = _venv_python(venv_dir)
-    if not py.exists():
-        raise SystemExit(f"Could not find venv python at: {py}")
-
-    # 3) Upgrade pip tooling
-    print("[3/6] Upgrading pip tooling...")
-    _run([str(py), "-m", "pip", "install", "-U", "pip", "setuptools", "wheel"])
-
-    # 4) Install moshi/. + Flask + HF hub client
-    print("[4/6] Installing moshi/. (from repo) + Flask + huggingface_hub...")
-    moshi_dir = repo_dir / "moshi"
-    if not moshi_dir.exists():
-        raise SystemExit(f"Expected '{moshi_dir}' to exist, but it doesn't. Repo layout may have changed.")
-    _run([str(py), "-m", "pip", "install", "-U", "moshi/."], cwd=str(repo_dir))
-    _run([str(py), "-m", "pip", "install", "-U", "flask", "werkzeug", "huggingface_hub"])
-
-    # 5) Write demo files
-    print("[5/6] Writing Flask demo app + UI...")
-    templates_dir.mkdir(parents=True, exist_ok=True)
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    (demo_dir / "app.py").write_text(APP_PY, encoding="utf-8")
-    (templates_dir / "index.html").write_text(INDEX_HTML, encoding="utf-8")
-
-    # 6) Run
-    print("[6/6] Ready.")
-    print(
-        textwrap.dedent(
-            f"""
-            ============================================================
-            Flask demo will be available at:
-              http://{args.host}:{args.port}
-
-            Model repo id:
-              {args.model}
-
-            Notes:
-              - Enter your Hugging Face token in the web UI to enable:
-                  * model size stats
-                  * one-click download
-                  * auto-download on first run
-              - The HF cache is stored under:
-                  {workdir}/.hf
-
-            ============================================================
-            """
-        ).strip()
-    )
-
-    if args.no_run:
-        print("\nBootstrap complete (--no-run set).")
-        return
-
-    env = os.environ.copy()
-    env["FLASK_HOST"] = str(args.host)
-    env["FLASK_PORT"] = str(args.port)
-    env["PP_MODEL_REPO_ID"] = str(args.model)
-
-    # Keep HF cache project-local (also used by moshi.offline subprocess)
-    env["HF_HOME"] = str((workdir / ".hf").resolve())
-    env["HF_HUB_CACHE"] = str(((workdir / ".hf") / "hub").resolve())
-
-    _run([str(py), str(demo_dir / "app.py")], cwd=str(workdir), env=env)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
